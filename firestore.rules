@@ -1,0 +1,106 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Existe um vínculo (conversa individual ou grupo em comum) mantido pela API.
+    // users/{dono}/contacts/{quemConsulta}
+    function hasSharedConversation(uid) {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(uid)/contacts/$(request.auth.uid));
+    }
+
+    function validUser(uid, d) {
+      return d.keys().hasOnly(['uid', 'name', 'email', 'phoneNumber', 'birthDate', 'photoUrl', 'createdAt'])
+        && d.uid == uid
+        && d.name is string && d.name.size() >= 2 && d.name.size() <= 80
+        && d.email is string && d.email.lower() == request.auth.token.email.lower()
+        && d.phoneNumber is string && d.phoneNumber.matches('^[0-9]{10,13}$')
+        && d.birthDate is string && d.birthDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && d.photoUrl is string && d.photoUrl.size() < 2048
+        && d.createdAt is number;
+    }
+
+    function validPublicProfile(uid, d) {
+      return d.keys().hasOnly(['uid', 'name', 'photoUrl'])
+        && d.uid == uid
+        && d.name is string && d.name.size() >= 2 && d.name.size() <= 80
+        && d.photoUrl is string && d.photoUrl.size() < 2048;
+    }
+
+    // Perfil público: apenas nome e foto, visível a qualquer usuário autenticado
+    // (necessário para a busca de usuários).
+    match /publicProfiles/{uid} {
+      allow read: if signedIn();
+      allow create: if isSelf(uid) && validPublicProfile(uid, request.resource.data);
+      allow update: if isSelf(uid) && validPublicProfile(uid, request.resource.data);
+      allow delete: if false;
+    }
+
+    // Dados cadastrais completos: dono ou quem compartilha conversa/grupo.
+    match /users/{uid} {
+      allow read: if isSelf(uid) || hasSharedConversation(uid);
+      allow create: if isSelf(uid) && validUser(uid, request.resource.data);
+      allow update: if isSelf(uid)
+        && validUser(uid, request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.email == resource.data.email;
+      allow delete: if false;
+
+      // Tokens de dispositivo: nunca públicos.
+      match /devices/{deviceId} {
+        allow read, delete: if isSelf(uid);
+        allow create, update: if isSelf(uid)
+          && request.resource.data.keys().hasOnly(['token', 'tokenType', 'platform', 'enabled', 'updatedAt'])
+          && request.resource.data.token is string
+          && request.resource.data.tokenType in ['fcm', 'expo']
+          && request.resource.data.platform in ['ios', 'android']
+          && request.resource.data.enabled is bool
+          && request.resource.data.updatedAt is number;
+      }
+
+      // Vínculos mantidos exclusivamente pela API (Admin SDK).
+      match /contacts/{otherUid} {
+        allow read: if isSelf(uid);
+        allow write: if false;
+      }
+    }
+
+    // Grupos: criação e alteração de integrantes/limite apenas pela API (transações).
+    // O proprietário pode editar apenas metadados diretamente.
+    match /groups/{groupId} {
+      allow read: if signedIn() && request.auth.uid in resource.data.memberIds;
+      allow create: if false;
+      allow delete: if false;
+      allow update: if signedIn()
+        && resource.data.ownerId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'photoUrl', 'notificationPolicy', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 60
+        && request.resource.data.photoUrl is string && request.resource.data.photoUrl.size() < 2048
+        && request.resource.data.notificationPolicy in
+             ['all_group_messages', 'mentioned_members', 'direct_messages_only', 'disabled']
+        && request.resource.data.updatedAt is number;
+    }
+
+    // Conversas individuais: criadas pela API (id = uids ordenados).
+    match /directConversations/{conversationId} {
+      allow read: if signedIn() && request.auth.uid in resource.data.participantIds;
+      allow write: if false;
+    }
+
+    // Controle de idempotência das notificações: somente Admin SDK.
+    match /notificationLogs/{logId} {
+      allow read, write: if false;
+    }
+  }
+}
